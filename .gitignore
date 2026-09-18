@@ -1,0 +1,4 @@
+__pycache__/
+gambit/
+*.log
+local-evidence/

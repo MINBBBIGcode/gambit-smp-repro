@@ -1,0 +1,34 @@
+name: Timed mutex comparison
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  compare:
+    if: github.event.repository.private == false && github.repository_owner == 'MINBBBIGcode'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        mode: [unicore, smp]
+    steps:
+      - name: Check out exact public harness commit without credentials
+        env:
+          HARNESS_REPOSITORY: ${{ github.repository }}
+          HARNESS_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$HARNESS_REPOSITORY" = "MINBBBIGcode/gambit-smp-repro"
+          git init harness
+          git -C harness remote add origin "https://github.com/$HARNESS_REPOSITORY.git"
+          git -C harness fetch --depth=1 origin "$HARNESS_COMMIT"
+          git -C harness checkout --detach FETCH_HEAD
+          test "$(git -C harness rev-parse HEAD)" = "$HARNESS_COMMIT"
+      - name: Build and run bounded comparison
+        env:
+          PROBE_MODE: ${{ matrix.mode }}
+        run: python3 harness/probe.py "$PROBE_MODE"
