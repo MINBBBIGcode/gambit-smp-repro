@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -17,14 +18,14 @@ TEST = "tests/unit-tests/06-thread/mutex_race_timeout.scm"
 EXPECTED_REPOSITORY = "MINBBBIGcode/gambit-smp-repro"
 
 
-def bounded(command, *, cwd, seconds, label):
+def bounded(command, *, cwd, seconds, label, env=None):
     """Kill the process group at timeout and retain a bounded diagnostic tail."""
     started = time.monotonic()
     log = Path(cwd) / (label + ".log")
     with log.open("wb") as stream:
         child = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
                                  stdout=stream, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
+                                 start_new_session=True, env=env)
         timed_out = False
         try:
             child.wait(timeout=seconds)
@@ -36,15 +37,29 @@ def bounded(command, *, cwd, seconds, label):
         size = stream.seek(0, 2)
         stream.seek(max(0, size - 6000))
         tail = stream.read().decode("utf-8", errors="replace")
+    first_error_context = []
+    if timed_out or child.returncode != 0:
+        previous = []
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if re.search(r"error:|fatal error|FATAL ERROR|Segmentation fault", line):
+                    first_error_context = previous[-4:] + [line.rstrip()[:1000]]
+                    for following in stream:
+                        first_error_context.append(following.rstrip()[:1000])
+                        if len(first_error_context) >= 12:
+                            break
+                    break
+                previous.append(line.rstrip()[:1000])
+                previous = previous[-4:]
     result = dict(label=label, command=command, returncode=child.returncode,
                   timed_out=timed_out, elapsed_seconds=round(time.monotonic()-started, 3),
-                  output_bytes=size, tail=tail)
+                  output_bytes=size, tail=tail, first_error_context=first_error_context)
     print("STEP_RESULT " + json.dumps(result), flush=True)
     return result
 
 
-def require_step(command, *, cwd, seconds, label):
-    result = bounded(command, cwd=cwd, seconds=seconds, label=label)
+def require_step(command, *, cwd, seconds, label, env=None):
+    result = bounded(command, cwd=cwd, seconds=seconds, label=label, env=env)
     if result["timed_out"] or result["returncode"] != 0:
         raise RuntimeError(label + ": infrastructure/build failed")
     return result
@@ -87,10 +102,21 @@ def main():
                   ["--disable-smp", "--disable-multiple-threaded-vms"])
         record["configure_flags"] = flags[1:]
         require_step(flags, cwd=source, seconds=120, label="configure")
+        # Isolate compiler/code generation from the runtime under test.
+        # lib/main.c names GAMBOPT and parses it before command-line options.
+        build_env = dict(os.environ, GAMBOPT="p1")
+        record["build_runtime_options"] = {"GAMBOPT": "p1"}
         # Current .scm must be compiled; stale release .c files are insufficient.
-        require_step(["make", "-j2", "bootstrap"], cwd=source, seconds=600, label="bootstrap")
-        require_step(["make", "bootclean"], cwd=source, seconds=60, label="bootclean")
-        require_step(["make", "-j2", "core"], cwd=source, seconds=600, label="core")
+        require_step(["make", "-j2", "bootstrap"], cwd=source, seconds=600, label="bootstrap", env=build_env)
+        generator_runtime = f"-:~~lib={source}/lib,~~bin={source}/bin,~~include={source}/include"
+        generator = require_step([str(source / "gsc-boot"), generator_runtime, "-f", "-e",
+                                  "(write (##current-vm-processor-count)) (newline)"],
+                                 cwd=source, seconds=20, label="generator-smoke", env=build_env)
+        if generator["tail"].strip() != "1":
+            raise RuntimeError("Build compiler did not use one VM processor")
+        record["build_vm_processors_verified"] = 1
+        require_step(["make", "bootclean"], cwd=source, seconds=60, label="bootclean", env=build_env)
+        require_step(["make", "-j2", "core"], cwd=source, seconds=600, label="core", env=build_env)
         processors = 2 if args.mode == "smp" else 1
         runtime = (f"-:p{processors},~~lib={source}/lib,~~bin={source}/bin,"
                    f"~~include={source}/include")
