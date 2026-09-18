@@ -14,6 +14,8 @@ import time
 
 SOURCE = "https://github.com/gambit/gambit.git"
 COMMIT = "a6237f30ad94e33bb3a22e096aaed0dffc18814f"
+BOOTSTRAP_TAG = "v4.9.8"
+BOOTSTRAP_COMMIT = "2228e4d163582733a3a67a5efcb22f8ebe93c02b"
 TEST = "tests/unit-tests/06-thread/mutex_race_timeout.scm"
 EXPECTED_REPOSITORY = "MINBBBIGcode/gambit-smp-repro"
 
@@ -84,14 +86,31 @@ def main():
         require_step(["git", "init", "."], cwd=source, seconds=30, label="init")
         require_step(["git", "remote", "add", "origin", SOURCE], cwd=source,
                      seconds=30, label="remote")
-        require_step(["git", "fetch", "--depth=1", "origin", COMMIT], cwd=source,
-                     seconds=90, label="fetch")
-        require_step(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=source,
+        # Gambit's bootstrap uses git describe and archives its release tag.
+        # A shallow/tagless clone selects its dummy compiler path instead.
+        require_step(["git", "fetch", "--no-tags", "origin", COMMIT], cwd=source,
+                     seconds=300, label="fetch")
+        require_step(["git", "fetch", "--no-tags", "origin",
+                      f"refs/tags/{BOOTSTRAP_TAG}:refs/tags/{BOOTSTRAP_TAG}"],
+                     cwd=source, seconds=60, label="fetch-bootstrap-tag")
+        require_step(["git", "checkout", "--detach", COMMIT], cwd=source,
                      seconds=30, label="checkout")
         actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source,
                                          text=True, timeout=10).strip()
         if actual != COMMIT:
             raise RuntimeError("Source revision mismatch")
+        release = subprocess.check_output(["git", "rev-parse", f"refs/tags/{BOOTSTRAP_TAG}^{{commit}}"],
+                                          cwd=source, text=True, timeout=10).strip()
+        shallow = subprocess.check_output(["git", "rev-parse", "--is-shallow-repository"],
+                                          cwd=source, text=True, timeout=10).strip()
+        if release != BOOTSTRAP_COMMIT or shallow != "false":
+            raise RuntimeError("Bootstrap release/history does not match the reviewed source")
+        subprocess.run(["git", "merge-base", "--is-ancestor", release, COMMIT],
+                       cwd=source, check=True, timeout=10)
+        record["bootstrap_release_commit"] = release
+        record["source_git_describe"] = subprocess.check_output(
+            ["git", "describe", "--tags", "--long", "HEAD"],
+            cwd=source, text=True, timeout=10).strip()
         record["test_sha256"] = hashlib.sha256((source / TEST).read_bytes()).hexdigest()
         record["compiler"] = subprocess.check_output(["gcc", "--version"], text=True,
                                                      timeout=10).splitlines()[0]
